@@ -184,6 +184,8 @@ def test_confirmed_registry_failure_returns_rejected(monkeypatch):
     assert body["communications"]
     compliance = next(r for r in body["reviews"] if r["stage"] == "IDENTITY_TAX_VALIDATION")
     assert compliance["status"] == "FAIL"
+    # The email must say exactly which pipeline stage the application failed at.
+    assert "Rejected at Stage 2 of 5 — Identity &amp; Tax Validation" in body["communications"][-1]["body"]
 
 
 def test_ai_cannot_approve_when_rule_checks_need_information(monkeypatch):
@@ -205,3 +207,32 @@ def test_ai_decides_when_rule_checks_pass(monkeypatch):
     body = client.post(f"/api/submissions/{vendor['id']}/evaluate").json()
     assert body["status"] == "REJECTED"
     assert body["ai_risk_score"] == 85
+
+
+def test_pan_embedded_in_gstin_is_consistent():
+    from app.services.review import _tax_ids_consistent
+    assert _tax_ids_consistent("29AAACB1234F1Z5", "AAACB1234F")
+    assert not _tax_ids_consistent("29AAACB1234F1Z5", "AAACX1234F")
+
+
+def test_real_world_indian_documents_are_extracted():
+    # OCR output shapes from a GST REG-06 table, an MCA incorporation certificate and a cancelled cheque.
+    from app.services.extraction import _fallback_extract
+    gst = _fallback_extract("1. |GSTIN 29AAACB1234F1Z5\n2. |Legal Name BluePeak Industrial Solutions Private Limited\n", "tax_certificate")
+    assert gst["fields"]["legal_name"] == "BluePeak Industrial Solutions Private Limited"
+    coi = _fallback_extract(
+        "I hereby certify that BluePeak Industrial Solutions Private Limited is incorporated on this Twelfth day\n"
+        "The Corporate Identity Number of the company is U00000KA2026PTC000001.\n", "registration_certificate")
+    assert coi["fields"]["legal_name"] == "BluePeak Industrial Solutions Private Limited"
+    assert coi["fields"]["registration_id"] == "U00000KA2026PTC000001"
+    cheque = _fallback_extract("IFS CODE: HDFC0001234\nBLUEPEAK INDUSTRIAL SOLUTIONS PRIVATE LIMITED\nAuthorised Signatory\n", "bank_proof")
+    assert cheque["fields"]["bank_account_holder"] == "BLUEPEAK INDUSTRIAL SOLUTIONS PRIVATE LIMITED"
+    assert cheque["fields"]["ifsc"] == "HDFC0001234"
+    assert _fallback_extract("the legal name of the company is below", "other")["fields"] == {}
+
+
+def test_demo_sample_two_is_bluepeak():
+    body = client.get("/api/demo/sample?variant=2").json()
+    assert body["legal_name"] == "BluePeak Industrial Solutions Private Limited"
+    assert body["tax_id"] == "29AAACB1234F1Z5"
+    assert client.get("/api/demo/sample").json()["legal_name"].startswith("Aarav")

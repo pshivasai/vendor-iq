@@ -7,6 +7,7 @@ Configure in .env:
   SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, SMTP_FROM
 """
 from __future__ import annotations
+import html as _html
 import logging
 import smtplib
 from email.mime.multipart import MIMEMultipart
@@ -24,6 +25,60 @@ STAGE_META = {
 }
 
 STAGE_ORDER = ["DOCUMENT_VERIFICATION", "IDENTITY_TAX_VALIDATION", "FINANCIAL_COMPLIANCE", "BUSINESS_PROCUREMENT", "AI_RISK_ASSESSMENT"]
+
+
+def stage_outcome(stages: list[dict]) -> dict:
+    """Work out where the pipeline stopped.
+
+    Returns {"failed": first FAIL stage or None, "held": [NEEDS_INFORMATION stages before it],
+    "actions": required actions from those stages}. Each stage dict gets "order" and "label".
+    """
+    by_key = {s.get("stage"): s for s in stages or []}
+    ordered = []
+    for key in STAGE_ORDER:
+        if key in by_key:
+            ordered.append({**by_key[key], "order": STAGE_META[key]["order"], "label": STAGE_META[key]["label"]})
+    failed = next((s for s in ordered if s.get("status") == "FAIL"), None)
+    cutoff = failed["order"] if failed else 99
+    held = [s for s in ordered if s.get("status") == "NEEDS_INFORMATION" and s["order"] < cutoff]
+    actions: list[str] = []
+    for s in held + ([failed] if failed else []):
+        for a in s.get("required_actions") or []:
+            if a not in actions:
+                actions.append(a)
+    return {"failed": failed, "held": held, "actions": actions}
+
+
+def _stage_ref(stage: dict) -> str:
+    return f"Stage {stage['order']} of {len(STAGE_ORDER)} — {stage['label']}"
+
+
+def _decision_headline(final_status: str, outcome: dict) -> str:
+    if final_status == "APPROVED":
+        return "✅ All 5 verification stages passed — Application Approved"
+    if final_status == "REJECTED" and outcome["failed"]:
+        return f"❌ Rejected at {_stage_ref(outcome['failed'])}"
+    if outcome["held"]:
+        first = outcome["held"][0]
+        more = len(outcome["held"]) - 1
+        extra = f" (+{more} more stage{'s' if more > 1 else ''})" if more else ""
+        return f"⏳ On hold at {_stage_ref(first)}{extra}"
+    if final_status == "REJECTED":
+        return "❌ Verification failed — Application could not be approved"
+    return "⏳ Under Manual Review — Our team is reviewing your application"
+
+
+def _actions_html(actions: list[str], title: str) -> str:
+    if not actions:
+        return ""
+    items = "".join(
+        f'<li style="margin:0 0 6px;font-size:13px;color:#78350f;line-height:1.5;">{_html.escape(a)}</li>' for a in actions
+    )
+    return f'''
+        <div style="background:#fffbeb;border:1px solid #fde68a;border-radius:10px;padding:16px 18px;margin:20px 0;">
+            <div style="font-weight:700;color:#b45309;font-size:13px;margin-bottom:8px;">{title}</div>
+            <ol style="margin:0;padding:0 0 0 18px;">{items}</ol>
+        </div>'''
 
 
 def send_vendor_email(to: str, subject: str, body_plain: str, body_html: str | None = None) -> bool:
@@ -128,18 +183,21 @@ def build_pipeline_html(stages: list[dict], final_status: str) -> str:
         if stage_data and meta["order"] <= first_fail_order:
             summary = stage_data.get("summary", "")
 
-        # Build findings HTML for failed stages
+        # Show the issues for any stage that failed or needs information
         findings_html = ""
-        if status == "FAIL" and stage_data:
+        if status in ("FAIL", "NEEDS_INFORMATION") and stage_data:
             findings = stage_data.get("findings", [])
             if findings:
+                is_fail = status == "FAIL"
+                text_c, box_bg, box_bd = ("#991b1b", "#fff5f5", "#fecaca") if is_fail else ("#92400e", "#fffbeb", "#fde68a")
+                heading = "❌ Why this stage failed" if is_fail else "⚠ Why this stage is on hold"
                 items = "".join(
-                    f'<li style="margin:0 0 4px;padding:4px 0;font-size:13px;color:#991b1b;line-height:1.5;">{f}</li>'
+                    f'<li style="margin:0 0 4px;padding:4px 0;font-size:13px;color:{text_c};line-height:1.5;">{_html.escape(str(f))}</li>'
                     for f in findings
                 )
                 findings_html = f'''
-                <div style="margin-top:8px;background:#fff5f5;border:1px solid #fecaca;border-radius:6px;padding:10px 12px;">
-                    <div style="font-size:10px;font-weight:700;color:#991b1b;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;">⚠ Issues Found</div>
+                <div style="margin-top:8px;background:{box_bg};border:1px solid {box_bd};border-radius:6px;padding:10px 12px;">
+                    <div style="font-size:10px;font-weight:700;color:{text_c};text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;">{heading}</div>
                     <ul style="margin:0;padding:0 0 0 16px;">{items}</ul>
                 </div>'''
 
@@ -151,8 +209,8 @@ def build_pipeline_html(stages: list[dict], final_status: str) -> str:
                 </div>
             </td>
             <td style="padding:12px 14px 12px 0;border-bottom:1px solid #f1f5f9;vertical-align:top;">
-                <div style="font-weight:700;color:#1e293b;font-size:14px;margin-bottom:2px;">{meta['icon']} {meta['label']}</div>
-                <div style="font-size:12px;color:#64748b;line-height:1.4;">{summary}</div>
+                <div style="font-weight:700;color:#1e293b;font-size:14px;margin-bottom:2px;"><span style="color:#94a3b8;font-weight:600;">{meta['order']}.</span> {meta['icon']} {meta['label']}</div>
+                <div style="font-size:12px;color:#64748b;line-height:1.4;">{_html.escape(str(summary))}</div>
                 {findings_html}
             </td>
             <td style="padding:12px 14px;border-bottom:1px solid #f1f5f9;text-align:right;vertical-align:top;width:100px;">
@@ -162,16 +220,14 @@ def build_pipeline_html(stages: list[dict], final_status: str) -> str:
             </td>
         </tr>'''
 
-    # Status banner
+    # Status banner names the exact stage where the pipeline stopped
+    banner_text = _html.escape(_decision_headline(final_status, stage_outcome(stages)))
     if final_status == "APPROVED":
         banner_bg = "linear-gradient(135deg, #059669 0%, #10b981 100%)"
-        banner_text = "✅ All verification stages passed — Application Approved"
     elif final_status == "REJECTED":
         banner_bg = "linear-gradient(135deg, #dc2626 0%, #ef4444 100%)"
-        banner_text = "❌ Verification failed — Application could not be approved"
     else:
         banner_bg = "linear-gradient(135deg, #d97706 0%, #f59e0b 100%)"
-        banner_text = "⏳ Under Manual Review — Our team is reviewing your application"
 
     return f'''
     <div style="margin:20px 0;">
@@ -286,25 +342,30 @@ VendorIQ"""
 def build_rejection_email(vendor, stages: list[dict] | None = None) -> tuple[str, str, str]:
     """Build rejection email with pipeline showing which stage failed. Returns (subject, plain_text, html)."""
     subject = f"❌ Your vendor application could not be approved — VendorIQ #{vendor.id}"
-    reason_text = vendor.ai_risk_reason or "The application did not meet our onboarding criteria."
-
-    # Find failing stage
-    failing_stages = []
-    for s in (stages or []):
-        if s.get("status") == "FAIL":
-            meta = STAGE_META.get(s.get("stage"), {})
-            failing_stages.append(meta.get("label", s.get("stage", "Unknown")))
-
-    failing_stage_text = ", ".join(failing_stages) if failing_stages else "verification"
+    outcome = stage_outcome(stages or [])
+    failed = outcome["failed"]
+    if failed and failed.get("findings"):
+        reasons = [str(f) for f in failed["findings"]]
+    else:
+        reasons = [vendor.ai_risk_reason or "The application did not meet our onboarding criteria."]
+    reason_text = " ".join(reasons)
+    failing_stage_text = _stage_ref(failed) if failed else "the verification"
+    held_text = "".join(
+        f"\n  - {_stage_ref(s)}: " + "; ".join(str(f) for f in s.get("findings") or []) for s in outcome["held"]
+    )
+    reasons_html = "".join(
+        f'<li style="font-size:13px;color:#7f1d1d;line-height:1.6;">{_html.escape(r)}</li>' for r in reasons
+    )
+    also_text = ("\nOther stages that also need attention:" + held_text + "\n") if held_text else ""
 
     plain_body = f"""Hello {vendor.contact_name},
 
 Thank you for submitting a vendor application for {vendor.legal_name}. After careful review, we are unable to approve it at this time.
 
-Your application was rejected at the {failing_stage_text} stage.
+Your application was rejected at {failing_stage_text}.
 
-Reason: {reason_text}
-
+Why it failed: {reason_text}
+{also_text}
 Application reference: #{vendor.id}
 
 If you believe this decision is incorrect, or if you have additional supporting documents that address the concerns above, please contact our compliance team and reference the application number above.
@@ -322,9 +383,10 @@ VendorIQ"""
         {pipeline_html}
 
         <div style="background:#fef2f2;border:1px solid #fecaca;border-radius:10px;padding:16px 18px;margin:20px 0;">
-            <div style="font-weight:700;color:#dc2626;font-size:13px;margin-bottom:6px;">Reason for Decision</div>
-            <p style="margin:0;font-size:13px;color:#7f1d1d;line-height:1.6;">{reason_text}</p>
+            <div style="font-weight:700;color:#dc2626;font-size:13px;margin-bottom:6px;">Failed at {_html.escape(failing_stage_text)}</div>
+            <ul style="margin:0;padding:0 0 0 18px;">{reasons_html}</ul>
         </div>
+        {_actions_html(outcome["actions"], "What you can do")}
 
         <table style="width:100%;border-collapse:collapse;margin:16px 0;" cellpadding="0" cellspacing="0">
             <tr>
@@ -344,23 +406,45 @@ VendorIQ"""
 def build_manual_review_email(vendor, stages: list[dict] | None = None) -> tuple[str, str, str]:
     """Build manual review email with pipeline showing current progress. Returns (subject, plain_text, html)."""
     subject = f"⏳ Your vendor application is under review — VendorIQ #{vendor.id}"
+    outcome = stage_outcome(stages or [])
+    held = outcome["held"]
+    if held:
+        status_line = "Your application is on hold at " + ", ".join(_stage_ref(s) for s in held) + "."
+        held_detail = "".join(
+            f"\n  - {_stage_ref(s)}: " + "; ".join(str(f) for f in s.get("findings") or []) for s in held
+        )
+        todo = "What we need from you:" + "".join(f"\n  {i}. {a}" for i, a in enumerate(outcome["actions"], 1))
+    else:
+        status_line = "All automated stages have completed and your application is with our team for a final manual review."
+        held_detail = ""
+        todo = "No action is required from you at this time."
 
     plain_body = f"""Hello {vendor.contact_name},
 
 Thank you for submitting a vendor application for {vendor.legal_name}. Your application has been received and is currently under manual review by our team.
 
-Our verification system has completed its automated checks, and your application has been forwarded to our team for further evaluation. We will notify you as soon as a decision has been made.
+{status_line}{held_detail}
+
+{todo}
 
 Application reference: #{vendor.id}
 Supplier category: {vendor.supplier_category}
 
-No action is required from you at this time. If you have any questions, please contact your procurement representative and reference the application number above.
+If you have any questions, please contact your procurement representative and reference the application number above.
 
 Regards,
 Vendor Onboarding Team
 VendorIQ"""
 
     pipeline_html = build_pipeline_html(stages or [], "PENDING")
+    if outcome["actions"]:
+        next_steps_html = _actions_html(outcome["actions"], "📌 What we need from you")
+    else:
+        next_steps_html = '''
+        <div style="background:#fffbeb;border:1px solid #fde68a;border-radius:10px;padding:16px 18px;margin:20px 0;">
+            <div style="font-weight:700;color:#b45309;font-size:13px;margin-bottom:6px;">⏳ What happens next?</div>
+            <p style="margin:0;font-size:13px;color:#78350f;line-height:1.6;">Our team is reviewing your application. This typically takes 1–3 business days. You will receive an email notification once a decision has been made. No action is required from you at this time.</p>
+        </div>'''
 
     html_content = f'''
         <p style="font-size:16px;margin:0 0 6px;">Hello <strong>{vendor.contact_name}</strong>,</p>
@@ -368,10 +452,7 @@ VendorIQ"""
 
         {pipeline_html}
 
-        <div style="background:#fffbeb;border:1px solid #fde68a;border-radius:10px;padding:16px 18px;margin:20px 0;">
-            <div style="font-weight:700;color:#b45309;font-size:13px;margin-bottom:6px;">⏳ What happens next?</div>
-            <p style="margin:0;font-size:13px;color:#78350f;line-height:1.6;">Our team is reviewing your application. This typically takes 1–3 business days. You will receive an email notification once a decision has been made. No action is required from you at this time.</p>
-        </div>
+        {next_steps_html}
 
         <table style="width:100%;border-collapse:collapse;margin:16px 0;" cellpadding="0" cellspacing="0">
             <tr>

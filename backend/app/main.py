@@ -545,7 +545,26 @@ def audit_history(submission_id: int, db: Session = Depends(get_db)):
 
 
 @app.get("/api/demo/sample")
-def sample_payload():
+def sample_payload(variant: int = 1):
+    if variant == 2:
+        # Matches the BluePeak GST certificate, certificate of incorporation and cancelled cheque
+        # (samples/bluepeak/), so every pipeline stage can pass when those documents are uploaded.
+        return {
+            "legal_name": "BluePeak Industrial Solutions Private Limited",
+            "country_code": "IN", "tax_id_type": "GSTIN", "tax_id": "29AAACB1234F1Z5",
+            "registration_id": "U00000KA2026PTC000001",
+            "registered_address": "Unit 14, Peenya Industrial Area, Bengaluru, Karnataka, India, 560058",
+            "contact_name": "Aditi Rao", "contact_email": "aditi.rao@bluepeakindustrial.example",
+            "supplier_category": "Industrial supplies",
+            "business_justification": (
+                "Supplier of industrial maintenance spares and plant consumables for the Peenya, Bengaluru "
+                "manufacturing unit; adds a second local source for approved preventive-maintenance purchase orders "
+                "to reduce lead times."
+            ),
+            "bank_account_holder": "BluePeak Industrial Solutions Private Limited",
+            "bank_country": "IN", "bank_code": "HDFC0001234",
+            "bank_reference": "HDFC cancelled cheque 001234, current A/C ending 5678",
+        }
     return {
         "legal_name": "Aarav Industrial Supplies Private Limited",
         "country_code": "IN", "tax_id_type": "GSTIN", "tax_id": "29ABCDE1234F1Z5",

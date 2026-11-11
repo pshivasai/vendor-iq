@@ -67,11 +67,25 @@ def _doc_identity_findings(vendor: VendorSubmission, documents: list[VendorDocum
         if extracted_name and name_similarity(vendor.legal_name, str(extracted_name)) < 0.72:
             findings.append(f"Name in {doc.original_filename} ('{extracted_name}') differs from the submitted legal name.")
             actions.append(f"Confirm the legal entity name shown on {doc.original_filename} or upload a corrected document.")
-        extracted_tax = fields.get("tax_id") or fields.get("gstin") or fields.get("pan") or fields.get("vat") or fields.get("ein") or fields.get("abn")
-        if extracted_tax and re.sub(r"\W", "", str(extracted_tax)).upper() != re.sub(r"\W", "", vendor.tax_id).upper():
+        extracted_ids = [fields.get(k) for k in ("tax_id", "gstin", "pan", "vat", "ein", "abn") if fields.get(k)]
+        if extracted_ids and not any(_tax_ids_consistent(vendor.tax_id, str(x)) for x in extracted_ids):
             findings.append(f"Tax identifier in {doc.original_filename} does not match the submitted tax ID.")
             actions.append(f"Confirm the tax identifier or upload the correct {doc.document_type.replace('_', ' ')}.")
     return findings, actions
+
+
+def _tax_ids_consistent(submitted: str, extracted: str) -> bool:
+    """Same ID, or an Indian PAN that is embedded in a GSTIN (GSTIN characters 3-12 are the PAN)."""
+    a, b = re.sub(r"\W", "", submitted).upper(), re.sub(r"\W", "", extracted).upper()
+    if a == b:
+        return True
+    gstin = r"[0-9]{2}([A-Z]{5}[0-9]{4}[A-Z])[1-9A-Z]Z[0-9A-Z]"
+    pan = r"[A-Z]{5}[0-9]{4}[A-Z]"
+    for g, p in ((a, b), (b, a)):
+        m = re.fullmatch(gstin, g)
+        if m and re.fullmatch(pan, p) and m.group(1) == p:
+            return True
+    return False
 
 
 def document_verification(docs: list[VendorDocument]) -> dict:
@@ -214,6 +228,14 @@ def financial_compliance(vendor: VendorSubmission, docs: list[VendorDocument]) -
             if extracted_holder and name_similarity(vendor.bank_account_holder, str(extracted_holder)) < 0.72:
                 findings.append(f"Bank account holder in {doc.original_filename} conflicts with the submitted bank account holder.")
                 actions.append("Provide bank proof showing the same account holder, or explain the legal relationship and provide independent evidence.")
+            elif extracted_holder:
+                evidence.append(f"Account holder on {doc.original_filename} matches the submitted bank account holder.")
+            extracted_ifsc = (doc.extraction_json or {}).get("fields", {}).get("ifsc")
+            if extracted_ifsc and vendor.bank_country.upper() == "IN" and str(extracted_ifsc).upper() != re.sub(r"[^A-Z0-9]", "", vendor.bank_code.upper()):
+                findings.append(f"IFSC on {doc.original_filename} ({extracted_ifsc}) differs from the submitted bank code ({vendor.bank_code}).")
+                actions.append("Confirm the bank routing code shown on the bank proof.")
+            elif extracted_ifsc:
+                evidence.append(f"IFSC on {doc.original_filename} matches the submitted bank code.")
 
     holder_score = name_similarity(vendor.legal_name, vendor.bank_account_holder)
     if holder_score < 0.72:

@@ -138,15 +138,36 @@ def _fallback_extract(text: str, supplied_type: str) -> dict[str, Any]:
         match = re.search(pattern, upper)
         if match:
             fields[key] = match.group(0)
-    name_match = re.search(r"(?:LEGAL NAME|COMPANY NAME|BUSINESS NAME)\s*[:\-]\s*([^\n\r]+)", text, re.I)
+    # "Legal Name: X", or table rows from OCR such as "2. |Legal Name  X" (no colon).
+    # Without a separator, the value must start with a capital/digit so prose like "legal name of ..." is ignored.
+    name_match = re.search(r"(?i:LEGAL NAME|COMPANY NAME|BUSINESS NAME)\s*(?:[:\-|]\s*|\s+(?=[A-Z0-9]))([^\n\r|]+)", text)
+    if not name_match:
+        # Indian Certificate of Incorporation: "I hereby certify that X is incorporated ..."
+        name_match = re.search(r"certify\s+that\s+(.+?)\s+is\s+incorporated", text, re.I | re.S)
     if name_match:
-        fields["legal_name"] = name_match.group(1).strip()[:240]
-    bank_holder_match = re.search(r"BANK ACCOUNT HOLDER\s*[:\-]\s*([^\n\r]+)", text, re.I)
+        name = re.sub(r"\s+", " ", name_match.group(1)).strip(" .,|")
+        if name:
+            fields["legal_name"] = name[:240]
+    bank_holder_match = re.search(r"(?:BANK ACCOUNT HOLDER|ACCOUNT HOLDER NAME|ACCOUNT NAME)\s*[:\-]\s*([^\n\r]+)", text, re.I)
+    if not bank_holder_match:
+        # Cheques print the account holder's name directly above "Authorised Signatory".
+        bank_holder_match = re.search(
+            r"^[ \t|]*([A-Z0-9][A-Z0-9&.,'()\- ]+?(?:PRIVATE LIMITED|PVT\.? LTD\.?|LIMITED|LTD\.?|LLP))[ \t]*\r?\n\s*AUTHORI[SZ]ED SIGNATORY",
+            upper, re.M,
+        )
     if bank_holder_match:
         fields["bank_account_holder"] = bank_holder_match.group(1).strip()[:240]
     registration_match = re.search(r"(?:REGISTRATION ID|REGISTRATION NUMBER|CIN|COMPANY NUMBER)\s*[:\-]\s*([^\n\r]+)", text, re.I)
     if registration_match:
         fields["registration_id"] = registration_match.group(1).strip()[:100]
+    else:
+        # Indian Corporate Identity Number, e.g. U27100KA2020PTC123456
+        cin_match = re.search(r"\b[LU][0-9]{5}[A-Z]{2}[0-9]{4}[A-Z]{3}[0-9]{6}\b", upper)
+        if cin_match:
+            fields["registration_id"] = cin_match.group(0)
+    ifsc_match = re.search(r"\b[A-Z]{4}0[A-Z0-9]{6}\b", upper)
+    if ifsc_match and supplied_type in {"bank_proof", "bank_statement", "void_cheque"}:
+        fields["ifsc"] = ifsc_match.group(0)
     expiry_match = re.search(r"(?:EXPIRY|EXPIRES|VALID UNTIL|EXPIRATION DATE)\s*[:\-]\s*([0-9./-]{6,12})", text, re.I)
     if expiry_match:
         fields["expiry_date"] = expiry_match.group(1).strip()

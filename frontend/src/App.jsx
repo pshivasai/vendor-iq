@@ -89,32 +89,63 @@ function getStageStatusIcon(status) {
   return <CircleHelp size={10}/>;
 }
 
+// ── Pipeline outcome: which stage stopped the application ─────────────────────
+
+function pipelineOutcome(reviews) {
+  const byKey = Object.fromEntries((reviews || []).map((r) => [r.stage, r]));
+  const stages = PIPELINE_STAGES.map((cfg, i) => ({
+    ...cfg,
+    order: i + 1,
+    status: byKey[cfg.key]?.status || 'NOT_REACHED',
+    findings: byKey[cfg.key]?.findings || [],
+    evidence: byKey[cfg.key]?.evidence || [],
+    required_actions: byKey[cfg.key]?.required_actions || [],
+  }));
+  const failed = stages.find((s) => s.status === 'FAIL') || null;
+  const cutoff = failed ? failed.order : 99;
+  const held = stages.filter((s) => s.status === 'NEEDS_INFORMATION' && s.order < cutoff);
+  return { stages, failed, held, ran: (reviews || []).length > 0 };
+}
+
+const stageRef = (s) => `Stage ${s.order} of ${PIPELINE_STAGES.length} — ${s.label}`;
+
+function decisionHeadline(status, outcome) {
+  if (!outcome.ran) return { title: 'Not evaluated yet', detail: 'Run checks to send this application through the 5-stage pipeline.' };
+  if (status === 'APPROVED') return { title: `All ${PIPELINE_STAGES.length} stages passed`, detail: 'Every verification stage passed and the vendor was approved.' };
+  if (status === 'REJECTED' && outcome.failed) {
+    return { title: `Failed at ${stageRef(outcome.failed)}`, detail: outcome.failed.findings[0] || 'This stage did not pass.', stage: outcome.failed };
+  }
+  if (outcome.held.length) {
+    const first = outcome.held[0];
+    const more = outcome.held.length - 1;
+    return {
+      title: `On hold at ${stageRef(first)}${more ? ` (+${more} more)` : ''}`,
+      detail: first.findings[0] || 'This stage needs more information.',
+      stage: first,
+    };
+  }
+  if (status === 'REJECTED') return { title: 'Rejected', detail: 'The application did not pass verification.' };
+  return { title: 'Awaiting manual review', detail: 'All automated stages finished; an admin will make the final decision.' };
+}
+
 // ── Pipeline Visualization Component ──────────────────────────────────────────
 
-function PipelineVisualization({ reviews, pipelineStages, riskScore, riskLevel, riskReason }) {
-  const [selectedStage, setSelectedStage] = useState(null);
+function PipelineVisualization({ reviews, pipelineStages, riskScore, riskLevel, riskReason, status }) {
+  // Build stage list from reviews (submission API) or pipeline_stages (admin API)
+  const source = reviews?.length ? reviews : (pipelineStages || []);
+  const sourceKey = JSON.stringify(source.map((s) => [s.stage, s.status, s.findings]));
+  const outcome = useMemo(() => pipelineOutcome(source), [sourceKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  const stages = outcome.stages;
+  const blockingIdx = useMemo(() => {
+    const target = outcome.failed || outcome.held[0];
+    return target ? target.order - 1 : null;
+  }, [outcome]);
 
-  // Build stage map from reviews (submission API) or pipeline_stages (admin API)
-  const stageData = useMemo(() => {
-    const source = reviews?.length ? reviews : (pipelineStages || []);
-    const map = {};
-    for (const r of source) {
-      map[r.stage] = r;
-    }
-    return map;
-  }, [reviews, pipelineStages]);
+  // Open the stage that stopped the application, and re-open it after a re-run.
+  const [selectedStage, setSelectedStage] = useState(blockingIdx);
+  useEffect(() => { setSelectedStage(blockingIdx); }, [blockingIdx, sourceKey]);
 
-  const stages = PIPELINE_STAGES.map((cfg) => {
-    const data = stageData[cfg.key];
-    return {
-      ...cfg,
-      status: data?.status || 'NOT_REACHED',
-      findings: data?.findings || [],
-      evidence: data?.evidence || [],
-      required_actions: data?.required_actions || [],
-    };
-  });
-
+  const headline = status ? decisionHeadline(status, outcome) : null;
   const activeStage = selectedStage != null ? stages[selectedStage] : null;
 
   return (
@@ -140,6 +171,14 @@ function PipelineVisualization({ reviews, pipelineStages, riskScore, riskLevel, 
           </div>
         </div>
       </div>
+
+      {/* Where the pipeline stopped */}
+      {headline && outcome.ran && (
+        <div className={`pipeline-verdict ${status === 'APPROVED' ? 'pass' : status === 'REJECTED' ? 'fail' : 'pending'}`}>
+          {status === 'APPROVED' ? <CheckCircle2 size={16}/> : status === 'REJECTED' ? <XCircle size={16}/> : <Clock3 size={16}/>}
+          <div><b>{headline.title}</b><span>{headline.detail}</span></div>
+        </div>
+      )}
 
       {/* AI Summary */}
       {riskReason && (
@@ -185,7 +224,7 @@ function PipelineVisualization({ reviews, pipelineStages, riskScore, riskLevel, 
               <div className="pipeline-detail-icon"><activeStage.icon size={16}/></div>
               <div>
                 <div className="pipeline-detail-name">{activeStage.label}</div>
-                <div className="pipeline-detail-desc">Stage {(selectedStage || 0) + 1} of 5</div>
+                <div className="pipeline-detail-desc">Stage {(selectedStage || 0) + 1} of 5{selectedStage === blockingIdx && status && status !== 'APPROVED' ? (activeStage.status === 'FAIL' ? ' · this is where the application failed' : ' · this is where the application is on hold') : ''}</div>
               </div>
             </div>
             <span className={`pipeline-status-tag ${getStageClass(activeStage.status)}`}>
@@ -390,6 +429,7 @@ function DetailPanel({ item, onClose, onDecide, busy }) {
               riskScore={item.ai_risk_score}
               riskLevel={item.ai_risk_level}
               riskReason={item.ai_risk_reason}
+              status={item.status}
             />
           </div>
 
@@ -522,11 +562,13 @@ export default function App() {
     setForm((old) => ({ ...old, country_code: value, bank_country: value, tax_id_type: nextTax }));
   };
 
-  const loadSample = async () => {
+  const loadSample = async (variant = 1) => {
     try {
-      const sample = await api.sample();
+      const sample = await api.sample(variant);
       setForm(sample);
-      setNotice('Demo supplier details loaded. Add the three documents below or submit without them.');
+      setNotice(variant === 2
+        ? 'Demo data 2 (BluePeak) loaded. Upload the BluePeak certificate of incorporation, GST certificate and cancelled cheque to pass all checks.'
+        : 'Demo supplier details loaded. Add the three documents below or submit without them.');
       setError('');
     } catch (e) { setError(e.message); }
   };
@@ -651,7 +693,7 @@ export default function App() {
       {/* ── New submission form ── */}
       {tab === 'new' ? <section className="content-grid new-view">
         <form className="panel submission-form" onSubmit={submit}>
-          <div className="panel-heading"><div><span className="section-kicker">SUPPLIER INTAKE</span><h2>Vendor details</h2><p>Capture the legal entity, tax identity, business purpose and payment destination.</p></div><button type="button" className="button secondary small" onClick={loadSample}>Load demo data</button></div>
+          <div className="panel-heading"><div><span className="section-kicker">SUPPLIER INTAKE</span><h2>Vendor details</h2><p>Capture the legal entity, tax identity, business purpose and payment destination.</p></div><div className="sample-buttons"><button type="button" className="button secondary small" onClick={()=>loadSample(1)}>Load demo data 1</button><button type="button" className="button secondary small" onClick={()=>loadSample(2)} title="BluePeak Industrial Solutions — matches the BluePeak documents">Load demo data 2</button></div></div>
           <div className="form-section-title"><span>01</span> Company information</div>
           <div className="form-grid">
             <Field label="Legal company name" required><input required value={form.legal_name} onChange={e=>updateField('legal_name',e.target.value)} placeholder="e.g. Northstar Components Ltd"/></Field>
@@ -837,27 +879,22 @@ export default function App() {
             <div className="detail-main">
               <div className="panel vendor-summary"><div className="vendor-summary-head"><div className="large-avatar">{selected.legal_name.slice(0,1).toUpperCase()}</div><div className="vendor-title"><span className="section-kicker">VENDOR PROFILE · #{selected.id}</span><h2>{selected.legal_name}</h2><p>{selected.supplier_category} · {selected.country_code} · {selected.contact_email}</p></div></div><div className="summary-meta"><div><small>TAX ID</small><b>{selected.tax_id_type} · {selected.tax_id}</b></div><div><small>SUBMITTED</small><b>{new Date(selected.submitted_at).toLocaleString()}</b></div><div><small>DOCUMENTS</small><b>{selected.documents?.length||0} uploaded</b></div></div></div>
 
-              {/* AI Analysis panel replacing old reviews panel */}
-              {selected.ai_risk_score != null && (
+              {/* Verification pipeline: shows every stage and opens the one that stopped the application */}
+              {selected.reviews?.length > 0 && (
                 <div className="panel reviews-panel">
-                  <div className="panel-heading"><div><span className="section-kicker">GEMINI AI ANALYSIS</span><h2>Risk assessment</h2><p>Gemini evaluated all form fields and uploaded documents.</p></div></div>
-                  <div className="ai-full-panel">
-                    <div className="ai-score-display">
-                      <RiskBadge score={selected.ai_risk_score} level={selected.ai_risk_level}/>
-                      <div className="ai-thresholds">
-                        <span className="threshold-chip low">≤30 Auto-Approve</span>
-                        <span className="threshold-chip medium">31–69 Manual</span>
-                        <span className="threshold-chip high">≥70 Auto-Reject</span>
-                      </div>
+                  <div className="panel-heading"><div><span className="section-kicker">VERIFICATION RESULT</span><h2>Pipeline</h2><p>Click any stage to see its findings and required actions.</p></div></div>
+                  <PipelineVisualization
+                    reviews={selected.reviews}
+                    riskScore={selected.ai_risk_score}
+                    riskLevel={selected.ai_risk_level}
+                    status={selected.status}
+                  />
+                  {selected.ai_detail_notes && (
+                    <div className="ai-detail-block">
+                      <div className="ai-detail-block-title"><Brain size={13}/> Gemini detailed analysis</div>
+                      <p>{selected.ai_detail_notes}</p>
                     </div>
-                    {selected.ai_risk_reason && <p className="ai-summary-text">{selected.ai_risk_reason}</p>}
-                    {selected.ai_detail_notes && (
-                      <div className="ai-detail-block">
-                        <div className="ai-detail-block-title"><Brain size={13}/> Detailed Analysis</div>
-                        <p>{selected.ai_detail_notes}</p>
-                      </div>
-                    )}
-                  </div>
+                  )}
                 </div>
               )}
 
@@ -866,7 +903,7 @@ export default function App() {
               </div>
             </div>
             <aside className="detail-side">
-              <div className="panel decision-card"><span className="section-kicker">FINAL DECISION</span><div className={`decision-symbol ${selected.status?.toLowerCase()}`}>{selected.status==='APPROVED'?<CheckCircle2 size={25}/>:selected.status==='REJECTED'?<XCircle size={25}/>:<Clock3 size={25}/>}</div><h2>{selected.status}</h2><p>{selected.status==='APPROVED'?'Gemini AI scored this LOW risk and auto-approved.':selected.status==='REJECTED'?'Gemini AI scored this HIGH risk and auto-rejected.':'Gemini AI scored this MEDIUM risk — awaiting admin review.'}</p>{selected.demo_mode&&<div className="demo-warning"><ShieldAlert size={14}/> Demo checks are not authoritative registry/bank verification.</div>}</div>
+              <div className="panel decision-card"><span className="section-kicker">FINAL DECISION</span><div className={`decision-symbol ${selected.status?.toLowerCase()}`}>{selected.status==='APPROVED'?<CheckCircle2 size={25}/>:selected.status==='REJECTED'?<XCircle size={25}/>:<Clock3 size={25}/>}</div><h2>{selected.status}</h2>{(()=>{const h=decisionHeadline(selected.status, pipelineOutcome(selected.reviews));return <div className="decision-reason"><b>{h.title}</b><p>{h.detail}</p></div>;})()}{selected.demo_mode&&<div className="demo-warning"><ShieldAlert size={14}/> Demo checks are not authoritative registry/bank verification.</div>}</div>
               {selected.communications?.length>0&&(()=>{
                 const comm = selected.communications[selected.communications.length-1];
                 const isHtml = comm.body && comm.body.trim().startsWith('<');

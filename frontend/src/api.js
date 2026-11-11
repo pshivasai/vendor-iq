@@ -23,7 +23,7 @@ export const api = {
   },
   evaluate: (id) => request(`/api/submissions/${id}/evaluate`, { method: 'POST' }),
   audit: (id) => request(`/api/submissions/${id}/audit`),
-  sample: () => request('/api/demo/sample'),
+  sample: (variant = 1) => request(`/api/demo/sample?variant=${variant}`),
   // Admin dashboard
   adminStats: () => request('/api/admin/stats'),
   adminDecision: (id, decision) => request(`/api/admin/submissions/${id}/decision`, {
