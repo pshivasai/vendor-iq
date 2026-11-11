@@ -53,9 +53,26 @@ from app.main import app as api_app  # noqa: E402  (import after secrets are in 
 # such as Streamlit Cloud's, the browser path may lack it, so fix it client-side first.
 _SLASH_FIX = "<script>if(!location.pathname.endsWith('/'))location.replace(location.pathname+'/'+location.search+location.hash)</script>"
 
+# Streamlit Community Cloud shows the app inside an iframe and keeps a loading spinner over it
+# until the guest page sends Streamlit's host-communication "ready" messages (normally sent by
+# Streamlit's own frontend). The React page sends the same messages so the wrapper reveals it.
+_CLOUD_HANDSHAKE = """<script>
+(function () {
+  if (window.parent === window) return;
+  var send = function (m) { m.stCommVersion = 1; window.parent.postMessage(m, '*'); };
+  var ready = function () {
+    var now = Date.now();
+    send({type: 'GUEST_READY', streamlitExecutionStartedAt: now, guestReadyAt: now});
+    send({type: 'WEBSOCKET_CONNECTED'});
+    send({type: 'SCRIPT_RUN_STATE_CHANGED', scriptRunState: 'notRunning'});
+  };
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', ready); else ready();
+})();
+</script>"""
+
 
 async def index(request):
-    page = (WEBAPP / "index.html").read_text(encoding="utf-8").replace("<head>", "<head>" + _SLASH_FIX, 1)
+    page = (WEBAPP / "index.html").read_text(encoding="utf-8").replace("<head>", "<head>" + _SLASH_FIX + _CLOUD_HANDSHAKE, 1)
     return HTMLResponse(page, headers={"Cache-Control": "no-cache"})
 
 
