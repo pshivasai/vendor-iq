@@ -83,6 +83,8 @@ def _load_submission(db: Session, submission_id: int) -> VendorSubmission:
             selectinload(VendorSubmission.communications),
             selectinload(VendorSubmission.reviews),
         )
+        # Session uses expire_on_commit=False; refresh so responses reflect rows just written.
+        .execution_options(populate_existing=True)
     )
     vendor = db.scalar(stmt)
     if not vendor:
@@ -232,7 +234,7 @@ def evaluate_submission(submission_id: int, db: Session = Depends(get_db)):
     documents = list(vendor.documents)
 
     # ── Run 4-stage pipeline review ───────────────────────────────────────────
-    _pipeline_status, pipeline_stages, _all_actions = evaluate_vendor(db, vendor)
+    pipeline_status, pipeline_stages, _all_actions = evaluate_vendor(db, vendor)
 
     # ── Gemini AI risk scoring + decisioning ──────────────────────────────────
     risk = score_vendor_risk(vendor, documents)
@@ -243,7 +245,18 @@ def evaluate_submission(submission_id: int, db: Session = Depends(get_db)):
     vendor.ai_detail_notes = risk.get("detail_notes")
     vendor.vendor_fields_snapshot = _build_fields_snapshot(vendor)
 
-    final_status = risk.get("final_status", "PENDING")
+    ai_status = risk.get("final_status", "PENDING")
+    ai_scored = risk.get("risk_score") is not None
+    # Deterministic rule checks are the floor: a failed check rejects, missing info holds.
+    # Gemini only decides when every rule stage passes; without Gemini, the rules decide alone.
+    if pipeline_status == "REJECTED":
+        final_status = "REJECTED"
+    elif pipeline_status == "PENDING":
+        final_status = "REJECTED" if ai_status == "REJECTED" else "PENDING"
+    elif ai_scored:
+        final_status = ai_status
+    else:
+        final_status = pipeline_status
     vendor.status = final_status
 
     # ── Build the 5th AI_RISK_ASSESSMENT stage ────────────────────────────────

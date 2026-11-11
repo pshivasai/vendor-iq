@@ -35,10 +35,21 @@ client = TestClient(app)
 
 
 @pytest.fixture(autouse=True)
-def clean_test_database():
+def clean_test_database(monkeypatch):
+    # Keep tests offline and deterministic: no real Gemini calls, no real SMTP.
+    from app.config import settings
+    monkeypatch.setattr(settings, "gemini_api_key", None)
+    monkeypatch.setattr(settings, "smtp_user", None)
     Base.metadata.drop_all(bind=TEST_ENGINE)
     Base.metadata.create_all(bind=TEST_ENGINE)
     yield
+
+
+def fake_ai(score, status):
+    def _score(vendor, documents=None):
+        level = "LOW" if score <= 30 else ("HIGH" if score >= 70 else "MEDIUM")
+        return {"risk_score": score, "risk_level": level, "reason": "stubbed", "detail_notes": "", "final_status": status}
+    return _score
 
 
 BASE = {
@@ -89,8 +100,11 @@ def test_happy_path_approved_in_demo_mode():
     assert result.status_code == 200, result.text
     body = result.json()
     assert body["status"] == "APPROVED"
-    assert {r["stage"] for r in body["reviews"]} == {"PROCUREMENT", "FINANCE", "COMPLIANCE"}
-    assert body["communications"] == []
+    assert {r["stage"] for r in body["reviews"]} == {
+        "DOCUMENT_VERIFICATION", "IDENTITY_TAX_VALIDATION", "FINANCIAL_COMPLIANCE",
+        "BUSINESS_PROCUREMENT", "AI_RISK_ASSESSMENT",
+    }
+    assert body["communications"][-1]["subject"].startswith("✅") or "approved" in body["communications"][-1]["subject"].lower()
 
 
 def test_edge_identity_conflict_requests_clarification():
@@ -102,7 +116,7 @@ def test_edge_identity_conflict_requests_clarification():
     assert body["status"] == "PENDING"
     assert any("differs from the submitted legal name" in f for r in body["reviews"] for f in r["findings"])
     assert body["communications"]
-    assert "upload a corrected document" in body["communications"][-1]["body"].lower()
+    assert any("upload a corrected document" in a.lower() for r in body["reviews"] for a in r["required_actions"])
 
 
 def test_edge_duplicate_vendor_is_flagged_not_merged():
@@ -116,7 +130,7 @@ def test_edge_duplicate_vendor_is_flagged_not_merged():
     second = create_vendor(second_payload)
     body = client.post(f"/api/submissions/{second['id']}/evaluate").json()
     assert body["status"] == "PENDING"
-    procurement = next(r for r in body["reviews"] if r["stage"] == "PROCUREMENT")
+    procurement = next(r for r in body["reviews"] if r["stage"] == "BUSINESS_PROCUREMENT")
     assert any("Potential duplicate supplier" in f for f in procurement["findings"])
 
 
@@ -127,7 +141,7 @@ def test_edge_bank_holder_mismatch_holds_finance_approval():
     upload_happy_path_docs(vendor["id"])
     body = client.post(f"/api/submissions/{vendor['id']}/evaluate").json()
     assert body["status"] == "PENDING"
-    finance = next(r for r in body["reviews"] if r["stage"] == "FINANCE")
+    finance = next(r for r in body["reviews"] if r["stage"] == "FINANCIAL_COMPLIANCE")
     assert finance["status"] == "NEEDS_INFORMATION"
     assert any("does not sufficiently match" in f for f in finance["findings"])
 
@@ -145,7 +159,7 @@ def test_edge_country_specific_tax_identifier_rules():
     })
     vendor = create_vendor(payload)
     body = client.post(f"/api/submissions/{vendor['id']}/evaluate").json()
-    compliance = next(r for r in body["reviews"] if r["stage"] == "COMPLIANCE")
+    compliance = next(r for r in body["reviews"] if r["stage"] == "IDENTITY_TAX_VALIDATION")
     assert not any("does not match the expected format" in f for f in compliance["findings"])
 
 
@@ -157,7 +171,7 @@ def test_dashboard_and_audit_endpoints():
     assert stats.json()["total"] >= 1
     audit = client.get(f"/api/submissions/{vendor['id']}/audit")
     assert audit.status_code == 200
-    assert any(row["action"] == "EVALUATION_COMPLETED" for row in audit.json())
+    assert any(row["action"] == "GEMINI_EVALUATION_COMPLETED" for row in audit.json())
 
 
 def test_confirmed_registry_failure_returns_rejected(monkeypatch):
@@ -168,5 +182,26 @@ def test_confirmed_registry_failure_returns_rejected(monkeypatch):
     body = client.post(f"/api/submissions/{vendor['id']}/evaluate").json()
     assert body["status"] == "REJECTED"
     assert body["communications"]
-    compliance = next(r for r in body["reviews"] if r["stage"] == "COMPLIANCE")
+    compliance = next(r for r in body["reviews"] if r["stage"] == "IDENTITY_TAX_VALIDATION")
     assert compliance["status"] == "FAIL"
+
+
+def test_ai_cannot_approve_when_rule_checks_need_information(monkeypatch):
+    from app import main
+    monkeypatch.setattr(main, "score_vendor_risk", fake_ai(5, "APPROVED"))
+    payload = dict(BASE)
+    payload["bank_account_holder"] = "XYZ Trading Enterprises"
+    vendor = create_vendor(payload)
+    upload_happy_path_docs(vendor["id"])
+    body = client.post(f"/api/submissions/{vendor['id']}/evaluate").json()
+    assert body["status"] == "PENDING"
+
+
+def test_ai_decides_when_rule_checks_pass(monkeypatch):
+    from app import main
+    monkeypatch.setattr(main, "score_vendor_risk", fake_ai(85, "REJECTED"))
+    vendor = create_vendor()
+    upload_happy_path_docs(vendor["id"])
+    body = client.post(f"/api/submissions/{vendor['id']}/evaluate").json()
+    assert body["status"] == "REJECTED"
+    assert body["ai_risk_score"] == 85
